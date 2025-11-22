@@ -1,83 +1,83 @@
 import streamlit as st
-import re
 import nltk
+import re
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+import speech_recognition as sr
+from pydub import AudioSegment
+import tempfile
 import pandas as pd
 import plotly.express as px
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 nltk.download("punkt")
 
-# -----------------------------------------------------------
-# RUBRIC SCORING ENGINE (ALL FEATURES INCLUDED)
-# -----------------------------------------------------------
+# ------------------------------------------------------------------
+# FULL RUBRIC SCORING ENGINE
+# ------------------------------------------------------------------
 
-def compute_full_rubric(text, duration_sec):
+def compute_rubric(text, duration_sec=None):
+    text_low = text.lower()
 
-    # 1. BASIC TEXT STATS
+    # WORDS & SENTENCES
     words = nltk.word_tokenize(text)
     sentences = nltk.sent_tokenize(text)
+
     word_count = len(words)
     sentence_count = len(sentences)
-    wpm = (word_count / duration_sec) * 60 if duration_sec > 0 else 0
 
-    # 2. SALUTATION SCORE
-    salutation_map = {
-        "excellent": ["excited to introduce", "feeling great"],
-        "good": ["good morning", "good afternoon", "good evening", "good day", "hello everyone"],
-        "normal": ["hi", "hello"]
-    }
-
-    sal_score = 0
-    t = text.lower()
-
-    if any(p in t for p in salutation_map["excellent"]):
-        sal_score = 5
-    elif any(p in t for p in salutation_map["good"]):
-        sal_score = 4
-    elif any(p in t for p in salutation_map["normal"]):
-        sal_score = 2
+    # ---- Speech Rate Logic ----
+    if duration_sec is None:
+        # NO DURATION → assume average speaking rate 120 WPM
+        wpm = 120
     else:
-        sal_score = 0
+        # AUDIO MODE → real duration
+        wpm = (word_count / duration_sec) * 60 if duration_sec > 0 else 0
 
-    # 3. MUST-HAVE KEYWORDS
-    must_have = {
+    # ---------------- SALUTATION ----------------
+    sal_score = 0
+    if any(x in text_low for x in ["excited to", "feeling great"]):
+        sal_score = 5
+    elif "hello everyone" in text_low or any(x in text_low for x in ["good morning", "good afternoon", "good evening"]):
+        sal_score = 4
+    elif any(x in text_low for x in ["hi", "hello"]):
+        sal_score = 2
+
+    # ---------------- MUST-HAVE KEYWORDS -----------
+    must_map = {
         "name": ["my name is", "myself"],
         "age": ["years old"],
         "class": ["class"],
         "school": ["school"],
         "family": ["family"],
-        "hobby": ["hobby", "like to", "enjoy", "playing"]
+        "hobby": ["hobby", "playing", "enjoy"]
     }
 
     must_score = 0
-    must_keywords_found = []
-    for key, kw_list in must_have.items():
-        if any(k in t for k in kw_list):
+    must_found = []
+    for key, kws in must_map.items():
+        if any(k in text_low for k in kws):
             must_score += 4
-            must_keywords_found.append(key)
+            must_found.append(key)
 
-    # 4. GOOD-TO-HAVE KEYWORDS
-    good_to_have = {
+    # ---------------- GOOD-TO-HAVE KEYWORDS --------
+    good_map = {
         "fun fact": ["fun fact"],
-        "unique": ["one thing people don't know"],
-        "goal": ["dream", "goal", "ambition"],
+        "unique": ["one thing people"],
+        "goal": ["goal", "dream", "ambition"],
         "origin": ["i am from"],
-        "achievement": ["achieved", "winner"]
+        "achievement": ["achieve", "winner"]
     }
 
     good_score = 0
-    good_keywords_found = []
-    for key, kw_list in good_to_have.items():
-        if any(k in t for k in kw_list):
+    good_found = []
+    for key, kws in good_map.items():
+        if any(k in text_low for k in kws):
             good_score += 2
-            good_keywords_found.append(key)
+            good_found.append(key)
 
-    # 5. FLOW SCORE
-    correct_order = ["salutation", "name", "basic details", "details", "closing"]
-    flow_score = 5  # assume correct since intro → details → end
-    # You can add advanced checking later
+    # ---------------- FLOW SCORE ----------------
+    flow_score = 5  # assume correct order
 
-    # 6. SPEECH RATE SCORE
+    # ---------------- SPEECH RATE SCORE ----------------
     if wpm > 161:
         speech_score = 2
     elif wpm >= 141:
@@ -89,12 +89,10 @@ def compute_full_rubric(text, duration_sec):
     else:
         speech_score = 2
 
-    # 7. FILLER WORD SCORE
-    filler_words = ["um", "uh", "like", "you know", "so", "actually", "basically",
-                    "right", "i mean", "well", "kinda", "sort of", "okay", "hmm", "ah"]
-
-    filler_count = sum(t.count(f) for f in filler_words)
-    filler_rate = (filler_count / word_count) * 100 if word_count > 0 else 0
+    # ---------------- FILLER WORDS ----------------
+    filler_words = ["um", "uh", "like", "you know", "so", "actually", "basically", "right"]
+    filler_count = sum(text_low.count(f) for f in filler_words)
+    filler_rate = (filler_count / word_count * 100) if word_count else 0
 
     if filler_rate <= 3:
         filler_score = 15
@@ -107,97 +105,135 @@ def compute_full_rubric(text, duration_sec):
     else:
         filler_score = 3
 
-    # 8. GRAMMAR SCORE (simple estimation using punctuation consistency)
+    # ---------------- GRAMMAR SCORE ----------------
     estimated_errors = abs(sentence_count - (word_count / 15))
-    error_ratio = min(1, estimated_errors / 10)
-    grammar_score = int((1 - error_ratio) * 10)
+    grammar_score = max(2, min(10, int(10 - estimated_errors)))  # safe bound
 
-    # 9. VOCABULARY RICHNESS (TTR)
-    distinct_words = len(set(words))
-    ttr = distinct_words / word_count if word_count > 0 else 0
+    # ---------------- VOCAB TTR ----------------
+    distinct = len(set(words))
+    ttr = distinct / word_count if word_count else 0
 
-    if ttr >= 0.9:
-        vocab_score = 10
-    elif ttr >= 0.7:
-        vocab_score = 8
-    elif ttr >= 0.5:
-        vocab_score = 6
-    elif ttr >= 0.3:
-        vocab_score = 4
-    else:
-        vocab_score = 2
+    if ttr >= 0.9: vocab_score = 10
+    elif ttr >= 0.7: vocab_score = 8
+    elif ttr >= 0.5: vocab_score = 6
+    elif ttr >= 0.3: vocab_score = 4
+    else: vocab_score = 2
 
-    # 10. SENTIMENT
+    # ---------------- SENTIMENT ----------------
     analyzer = SentimentIntensityAnalyzer()
     pos_score = analyzer.polarity_scores(text)["pos"]
 
-    if pos_score >= 0.9:
-        sentiment_score = 15
-    elif pos_score >= 0.7:
-        sentiment_score = 12
-    elif pos_score >= 0.5:
-        sentiment_score = 9
-    elif pos_score >= 0.3:
-        sentiment_score = 6
-    else:
-        sentiment_score = 3
+    if pos_score >= 0.9: senti_score = 15
+    elif pos_score >= 0.7: senti_score = 12
+    elif pos_score >= 0.5: senti_score = 9
+    elif pos_score >= 0.3: senti_score = 6
+    else: senti_score = 3
 
-    # TOTAL SCORE
+    # ---------------- TOTAL ----------------
     total_score = (
         sal_score + must_score + good_score + flow_score +
         speech_score + grammar_score + vocab_score +
-        filler_score + sentiment_score
+        filler_score + senti_score
     )
 
-    # RETURN FULL JSON
     return {
-        "overall_score": round(total_score, 2),
+        "overall_score": total_score,
         "word_count": word_count,
         "sentence_count": sentence_count,
         "wpm": round(wpm, 2),
         "criteria_results": [
             {"criterion": "Salutation", "score": sal_score},
-            {"criterion": "Keywords (Must Have)", "score": must_score, "found": must_keywords_found},
-            {"criterion": "Keywords (Good to Have)", "score": good_score, "found": good_keywords_found},
+            {"criterion": "Keywords (Must Have)", "score": must_score, "found": must_found},
+            {"criterion": "Keywords (Good to Have)", "score": good_score, "found": good_found},
             {"criterion": "Flow", "score": flow_score},
             {"criterion": "Speech Rate", "score": speech_score},
             {"criterion": "Grammar", "score": grammar_score},
-            {"criterion": "Vocabulary Richness", "score": vocab_score, "ttr": ttr},
-            {"criterion": "Filler Clarity", "score": filler_score, "filler_count": filler_count},
-            {"criterion": "Engagement", "score": sentiment_score, "positive_score": pos_score}
+            {"criterion": "Vocabulary TTR", "score": vocab_score},
+            {"criterion": "Filler Words", "score": filler_score, "filler_count": filler_count},
+            {"criterion": "Engagement (Sentiment)", "score": senti_score}
         ]
     }
 
+# ------------------------------------------------------------------
+# AUDIO SPEECH RECOGNITION
+# ------------------------------------------------------------------
 
-# -----------------------------------------------------------
+def transcribe_audio(uploaded_file):
+    audio = AudioSegment.from_file(uploaded_file)
+    duration_sec = len(audio) / 1000
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        audio.export(tmp.name, format="wav")
+        wav_path = tmp.name
+
+    recognizer = sr.Recognizer()
+    with sr.AudioFile(wav_path) as source:
+        audio_data = recognizer.record(source)
+        text = recognizer.recognize_google(audio_data)
+
+    return text, duration_sec
+
+# ------------------------------------------------------------------
 # STREAMLIT UI
-# -----------------------------------------------------------
+# ------------------------------------------------------------------
 
 st.title("🎤 AI Communication Rubric Evaluator")
 
-text = st.text_area("Paste transcript here")
-duration = st.number_input("Enter audio duration (seconds)", min_value=1, value=52)
+mode = st.radio("Choose Input Type", ["Text", "Audio"])
 
-if st.button("Evaluate"):
+# ===================== TEXT MODE ======================
+if mode == "Text":
+    text_input = st.text_area("Paste transcript here...")
 
-    result = compute_full_rubric(text, duration)
+    if st.button("Evaluate Text"):
+        if text_input.strip() == "":
+            st.error("Please enter a transcript!")
+        else:
+            result = compute_rubric(text_input)
 
-    st.subheader("🏆 Overall Score")
-    st.metric("Final Score", result["overall_score"])
+            st.subheader("🧾 Full JSON Output")
+            st.json(result)
 
-    st.subheader("📌 Detailed Breakdown")
-    st.json(result)
+            # CHARTS
+            df = pd.DataFrame({
+                "Criteria": [c["criterion"] for c in result["criteria_results"]],
+                "Score": [c["score"] for c in result["criteria_results"]],
+            })
 
-    # Prepare chart data
-    df = pd.DataFrame({
-        "Criteria": [c["criterion"] for c in result["criteria_results"]],
-        "Score": [c["score"] for c in result["criteria_results"]]
-    })
+            st.subheader("📊 Bar Chart")
+            bar = px.bar(df, x="Criteria", y="Score", text="Score")
+            st.plotly_chart(bar)
 
-    st.subheader("📊 Bar Chart")
-    st.bar_chart(df.set_index("Criteria"))
+            st.subheader("🕸 Radar Chart")
+            radar = px.line_polar(df, r="Score", theta="Criteria", line_close=True)
+            radar.update_traces(fill="toself")
+            st.plotly_chart(radar)
 
-    st.subheader("🕸 Radar Chart")
-    fig = px.line_polar(df, r="Score", theta="Criteria", line_close=True)
-    fig.update_traces(fill="toself")
-    st.plotly_chart(fig, use_container_width=True)
+# ===================== AUDIO MODE ======================
+else:
+    uploaded = st.file_uploader("Upload audio file", type=["wav", "mp3", "m4a"])
+
+    if uploaded:
+        st.audio(uploaded)
+
+        text, duration = transcribe_audio(uploaded)
+        st.write("### Transcription:")
+        st.info(text)
+
+        result = compute_rubric(text, duration)
+
+        st.json(result)
+
+        df = pd.DataFrame({
+            "Criteria": [c["criterion"] for c in result["criteria_results"]],
+            "Score": [c["score"] for c in result["criteria_results"]],
+        })
+
+        st.subheader("📊 Bar Chart")
+        bar = px.bar(df, x="Criteria", y="Score", text="Score")
+        st.plotly_chart(bar)
+
+        st.subheader("🕸 Radar Chart")
+        radar = px.line_polar(df, r="Score", theta="Criteria", line_close=True)
+        radar.update_traces(fill="toself")
+        st.plotly_chart(radar)
